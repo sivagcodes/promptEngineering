@@ -15,7 +15,7 @@ Run with:
     python mcp_server.py
 
 Pre-requisites:
-    pip install fastmcp mcp
+    pip install fastmcp mcp uvicorn
     npx playwright install chromium
 """
 
@@ -23,6 +23,7 @@ import json
 import os
 from contextlib import asynccontextmanager
 
+import uvicorn
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp import FastMCP
@@ -37,15 +38,13 @@ PLAYWRIGHT_MCP_PARAMS = StdioServerParameters(
 )
 
 # ── Global persistent session ─────────────────────────────────────────────────
-# One subprocess, one browser — state persists across every tool call.
 
 _session: ClientSession | None = None
-_stdio_cm = None      # keeps the stdio_client context manager alive
-_session_cm = None    # keeps the ClientSession context manager alive
+_stdio_cm = None
+_session_cm = None
 
 
 async def start_playwright_session():
-    """Launch @playwright/mcp subprocess and open a persistent MCP session."""
     global _session, _stdio_cm, _session_cm
 
     _stdio_cm = stdio_client(PLAYWRIGHT_MCP_PARAMS)
@@ -59,7 +58,6 @@ async def start_playwright_session():
 
 
 async def stop_playwright_session():
-    """Cleanly shut down the MCP session and kill the subprocess."""
     global _session, _stdio_cm, _session_cm
     if _session_cm:
         await _session_cm.__aexit__(None, None, None)
@@ -72,11 +70,6 @@ async def stop_playwright_session():
 # ── Tool proxy registration ───────────────────────────────────────────────────
 
 async def register_proxy_tools():
-    """
-    Ask @playwright/mcp for its full tool list and register each one
-    on this FastMCP server. All calls share the single persistent session
-    so browser state (current page, cookies, etc.) is maintained.
-    """
     tools_result = await _session.list_tools()
     tools: list[Tool] = tools_result.tools
 
@@ -91,7 +84,6 @@ def _register_tool(tool: Tool):
     tool_description = tool.description or tool_name
 
     async def proxy_fn(**kwargs) -> str:
-        # ✅ Reuses the single persistent session — browser state is preserved!
         result = await _session.call_tool(tool_name, arguments=kwargs)
         parts = []
         for block in result.content:
@@ -103,7 +95,6 @@ def _register_tool(tool: Tool):
 
     proxy_fn.__name__ = tool_name
     proxy_fn.__doc__ = tool_description
-
     mcp.add_tool(proxy_fn, name=tool_name, description=tool_description)
 
 
@@ -111,11 +102,10 @@ def _register_tool(tool: Tool):
 
 @asynccontextmanager
 async def lifespan(app):
-    """Start @playwright/mcp before accepting requests, stop it on shutdown."""
-    await start_playwright_session()   # 🚀 subprocess starts here
-    await register_proxy_tools()       # 🔧 tools registered here
-    yield                              # ✅ server is now ready
-    await stop_playwright_session()    # 🛑 clean shutdown
+    await start_playwright_session()
+    await register_proxy_tools()
+    yield
+    await stop_playwright_session()
 
 
 mcp = FastMCP("playwright-proxy", lifespan=lifespan)
@@ -124,4 +114,10 @@ mcp = FastMCP("playwright-proxy", lifespan=lifespan)
 
 if __name__ == "__main__":
     print("🚀 Starting FastMCP SSE server on http://0.0.0.0:8000/sse")
-    mcp.run(transport="sse", host="0.0.0.0", port=8000)
+
+    # ✅ Correct way to set host/port — via uvicorn directly on the ASGI app
+    uvicorn.run(
+        mcp.get_asgi_app(),   # FastMCP exposes an ASGI app
+        host="0.0.0.0",
+        port=8000,
+    )
